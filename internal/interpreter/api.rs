@@ -1272,6 +1272,15 @@ const _: () = {
     assert_send::<SendableCompilationResult>();
 };
 
+impl SendableCompilationResult {
+    /// This is an internal function without API stability guarantees.
+    #[doc(hidden)]
+    #[cfg(feature = "internal")]
+    pub fn watch_paths(&self, _: i_slint_core::InternalToken) -> &[SourcePath] {
+        &self.watch_paths
+    }
+}
+
 impl From<SendableCompilationResult> for CompilationResult {
     fn from(sent: SendableCompilationResult) -> Self {
         let SendableCompilationResult {

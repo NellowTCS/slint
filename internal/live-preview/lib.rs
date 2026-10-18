@@ -14,6 +14,9 @@ pub mod protocol;
 #[cfg(feature = "file-watcher")]
 pub mod file_watcher;
 
+#[cfg(feature = "live-compiler")]
+pub mod live_compiler;
+
 #[cfg(feature = "live-component")]
 pub mod live_component;
 
