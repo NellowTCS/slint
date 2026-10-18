@@ -416,6 +416,39 @@ interface MemberAccess {
     setCallback(name: string, callback: (...args: any[]) => any): void;
 }
 
+/**
+ * In a live preview, the properties and callbacks that JavaScript set on an instance,
+ * by name or `global.name`, to set them again after a reload.
+ */
+type Assignments = Map<string, () => void>;
+
+/** Records in `assignments` what is set through `access`, under `prefix` followed by the name. */
+function recordingAccess(
+    access: MemberAccess,
+    prefix: string,
+    assignments?: Assignments,
+): MemberAccess {
+    if (assignments === undefined) {
+        return access;
+    }
+    return {
+        getProperty: (name) => access.getProperty(name),
+        setProperty: (name, value) => {
+            access.setProperty(name, value);
+            assignments.set(prefix + name, () =>
+                access.setProperty(name, value),
+            );
+        },
+        invoke: (name, args) => access.invoke(name, args),
+        setCallback: (name, callback) => {
+            access.setCallback(name, callback);
+            assignments.set(prefix + name, () =>
+                access.setCallback(name, callback),
+            );
+        },
+    };
+}
+
 /** Defines the properties, callbacks, and functions on `target`, under their name in JavaScript. */
 function defineMembers(
     target: object,
@@ -458,6 +491,7 @@ function createGlobal(
     instance: napi.ComponentInstance,
     definition: napi.ComponentDefinition,
     globalName: string,
+    assignments?: Assignments,
 ): Record<string, unknown> {
     const globalObject = Object.create({});
     defineMembers(
@@ -467,15 +501,20 @@ function createGlobal(
             callbacks: definition.globalCallbacks(globalName) ?? [],
             functions: definition.globalFunctions(globalName) ?? [],
         },
-        {
-            getProperty: (name) => instance.getGlobalProperty(globalName, name),
-            setProperty: (name, value) =>
-                instance.setGlobalProperty(globalName, name, value),
-            invoke: (name, args) =>
-                instance.invokeGlobal(globalName, name, args),
-            setCallback: (name, callback) =>
-                instance.setGlobalCallback(globalName, name, callback),
-        },
+        recordingAccess(
+            {
+                getProperty: (name) =>
+                    instance.getGlobalProperty(globalName, name),
+                setProperty: (name, value) =>
+                    instance.setGlobalProperty(globalName, name, value),
+                invoke: (name, args) =>
+                    instance.invokeGlobal(globalName, name, args),
+                setCallback: (name, callback) =>
+                    instance.setGlobalCallback(globalName, name, callback),
+            },
+            `${globalName}.`,
+            assignments,
+        ),
     );
     return globalObject;
 }
@@ -567,6 +606,141 @@ function translateName(key: string): string {
     return key.replace(/-/g, "_");
 }
 
+/** Prints the warnings of a build, and throws its errors. */
+function checkDiagnostics(
+    diagnostics: napi.Diagnostic[],
+    filePath: string,
+    options?: LoadFileOptions,
+) {
+    if (diagnostics.length === 0) {
+        return;
+    }
+    if (typeof options !== "undefined" && options.quiet !== true) {
+        for (const d of diagnostics) {
+            switch (d.level) {
+                case napi.DiagnosticLevel.Warning:
+                    console.warn(`Warning: ${formatDiagnostic(d)}`);
+                    break;
+                case napi.DiagnosticLevel.Info:
+                    console.info(`Info: ${formatDiagnostic(d)}`);
+                    break;
+                case napi.DiagnosticLevel.Note:
+                    console.warn(`Note: ${formatDiagnostic(d)}`);
+                    break;
+            }
+        }
+    }
+
+    const errors = diagnostics.filter(
+        (d) => d.level === napi.DiagnosticLevel.Error,
+    );
+
+    if (errors.length > 0) {
+        throw new CompileError("Could not compile " + filePath, errors);
+    }
+}
+
+/**
+ * Puts the new version of each component of a {@link loadFile} call in the windows of its instances,
+ * when one of the files it read changes.
+ */
+class LiveSession {
+    definitions: Record<string, napi.ComponentDefinition> = {};
+    /** Dropping it stops the rebuilds. */
+    readonly #compiler: napi.ComponentCompiler;
+    readonly #filePath: string;
+    readonly #options?: LoadFileOptions;
+    readonly #instances = new Set<{
+        name: string;
+        instance: WeakRef<napi.ComponentInstance>;
+    }>();
+    /** Weak, since the recorded closures keep their instance alive. */
+    readonly #assignments = new WeakMap<napi.ComponentInstance, Assignments>();
+
+    constructor(
+        compiler: napi.ComponentCompiler,
+        filePath: string,
+        options?: LoadFileOptions,
+    ) {
+        this.#compiler = compiler;
+        this.#filePath = filePath;
+        this.#options = options;
+    }
+
+    /** Returns where to record what JavaScript sets on `instance`. */
+    track(name: string, instance: napi.ComponentInstance): Assignments {
+        const assignments: Assignments = new Map();
+        this.#instances.add({ name, instance: new WeakRef(instance) });
+        this.#assignments.set(instance, assignments);
+        return assignments;
+    }
+
+    reload(
+        diagnostics: napi.Diagnostic[],
+        definitions: Record<string, napi.ComponentDefinition>,
+    ) {
+        try {
+            checkDiagnostics(diagnostics, this.#filePath, this.#options);
+        } catch (error) {
+            console.error(`${error}`);
+            return;
+        }
+        this.definitions = definitions;
+
+        for (const entry of this.#instances) {
+            const instance = entry.instance.deref();
+            if (instance === undefined) {
+                this.#instances.delete(entry);
+                continue;
+            }
+            const definition = definitions[entry.name];
+            if (definition === undefined) {
+                console.warn(
+                    `Live preview: ${entry.name} isn't exported from ${this.#filePath} anymore`,
+                );
+                continue;
+            }
+            try {
+                instance.replaceWith(definition);
+            } catch (error) {
+                console.error(
+                    `Live preview: could not create ${entry.name}: ${error}`,
+                );
+                continue;
+            }
+            for (const [key, assignment] of this.#assignments.get(instance) ??
+                []) {
+                try {
+                    assignment();
+                } catch (error) {
+                    console.warn(
+                        `Live preview: could not set ${key} again: ${error}`,
+                    );
+                }
+            }
+        }
+        console.info(`Live preview: reloaded ${this.#filePath}`);
+    }
+}
+
+let warnedAboutMissingLivePreview = false;
+
+/**
+ * The callback for the rebuilds of a live session.
+ * The native compiler keeps it alive, and the session keeps that compiler alive,
+ * so it reaches the session weakly: what can still reload keeps the session instead.
+ * It's made here, so that it doesn't keep the scope of `loadSlint` alive.
+ */
+function rebuildCallback(session: WeakRef<LiveSession>) {
+    return (
+        diagnostics: napi.Diagnostic[],
+        definitions: Record<string, napi.ComponentDefinition>,
+    ) => session.deref()?.reload(diagnostics, definitions);
+}
+
+/** Keeps the live session of a component object alive. */
+const liveSession = Symbol("liveSession");
+
 function loadSlint(loadData: LoadData): Object {
     const { filePath, options } = loadData.fileData;
 
@@ -587,37 +761,31 @@ function loadSlint(loadData: LoadData): Object {
         }
     }
 
-    const definitions =
+    let session: LiveSession | null = null;
+    let definitions: Record<string, napi.ComponentDefinition> | null = null;
+    if (loadData.from === "file" && process.env.SLINT_LIVE_PREVIEW) {
+        try {
+            const created = new LiveSession(compiler, filePath, options);
+            definitions = compiler.buildFromPathLive(
+                filePath,
+                rebuildCallback(new WeakRef(created)),
+            );
+            created.definitions = definitions;
+            session = created;
+        } catch (error) {
+            if (!warnedAboutMissingLivePreview) {
+                warnedAboutMissingLivePreview = true;
+                console.warn(
+                    `SLINT_LIVE_PREVIEW is set, but the live preview couldn't start. ${(error as Error).message}`,
+                );
+            }
+        }
+    }
+    definitions ??=
         loadData.from === "file"
             ? compiler.buildFromPath(filePath)
             : compiler.buildFromSource(loadData.fileData.source, filePath);
-    const diagnostics = compiler.diagnostics;
-
-    if (diagnostics.length > 0) {
-        if (typeof options !== "undefined" && options.quiet !== true) {
-            for (const d of diagnostics) {
-                switch (d.level) {
-                    case napi.DiagnosticLevel.Warning:
-                        console.warn(`Warning: ${formatDiagnostic(d)}`);
-                        break;
-                    case napi.DiagnosticLevel.Info:
-                        console.info(`Info: ${formatDiagnostic(d)}`);
-                        break;
-                    case napi.DiagnosticLevel.Note:
-                        console.warn(`Note: ${formatDiagnostic(d)}`);
-                        break;
-                }
-            }
-        }
-
-        const errors = diagnostics.filter(
-            (d) => d.level === napi.DiagnosticLevel.Error,
-        );
-
-        if (errors.length > 0) {
-            throw new CompileError("Could not compile " + filePath, errors);
-        }
-    }
+    checkDiagnostics(compiler.diagnostics, filePath, options);
 
     const slint_module = Object.create({});
 
@@ -668,13 +836,17 @@ function loadSlint(loadData: LoadData): Object {
 
         Object.defineProperty(slint_module, translateName(definition.name), {
             value: function (properties: any) {
-                const instance = definition.create();
+                const instance = (
+                    session?.definitions[key] ?? definition
+                ).create();
 
                 if (instance == null) {
                     throw Error(
                         "Could not create a component handle for" + filePath,
                     );
                 }
+                const assignments = session?.track(key, instance);
+                const access = recordingAccess(instance, "", assignments);
 
                 // A `.slint` name may contain dashes, which JavaScript won't
                 // take as a plain identifier, so the properties and callbacks
@@ -691,16 +863,16 @@ function loadSlint(loadData: LoadData): Object {
                     declaredName.set(translateName(name), name);
                 }
 
-                for (var key in properties) {
-                    const value = properties[key];
+                for (const propertyKey in properties) {
+                    const value = properties[propertyKey];
                     // Unknown names are passed through, to be reported by the
                     // setter below.
-                    const name = declaredName.get(key) ?? key;
+                    const name = declaredName.get(propertyKey) ?? propertyKey;
 
                     if (value instanceof Function) {
-                        instance.setCallback(name, value);
+                        access.setCallback(name, value);
                     } else {
-                        instance.setProperty(name, properties[key]);
+                        access.setProperty(name, value);
                     }
                 }
 
@@ -710,6 +882,7 @@ function loadSlint(loadData: LoadData): Object {
                         instance,
                         componentDefinition,
                         globalName,
+                        assignments,
                     );
                 }
 
@@ -717,7 +890,12 @@ function loadSlint(loadData: LoadData): Object {
                     instance,
                     componentGlobals,
                 );
-                defineMembers(componentHandle, componentDefinition, instance);
+                if (session !== null) {
+                    Object.defineProperty(componentHandle, liveSession, {
+                        value: session,
+                    });
+                }
+                defineMembers(componentHandle, componentDefinition, access);
                 for (const [jsName, globalObject] of Object.entries(
                     componentGlobals,
                 )) {
@@ -764,6 +942,9 @@ function loadSlint(loadData: LoadData): Object {
  * A `slint-project.json` in the directory of the file, or in a directory above it,
  * provides the settings that `options` leaves open.
  * `filePath` can also be a `slint-project.json`, whose `main` is loaded.
+ *
+ * With the `SLINT_LIVE_PREVIEW` environment variable set, the components reload when one of their files changes.
+ * See [Live Preview](https://slint.dev/docs/slint/guide/tooling/live-preview/).
  *
  * @param filePath The path to the file to load as `string` or `URL`. Relative paths are resolved against the process' current working directory.
  * @param options An optional {@link LoadFileOptions} to configure additional Slint compilation settings,

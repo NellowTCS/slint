@@ -8,7 +8,7 @@ use super::{JsComponentInstance, JsProperty};
 
 #[napi(js_name = "ComponentDefinition")]
 pub struct JsComponentDefinition {
-    internal: ComponentDefinition,
+    pub(crate) internal: ComponentDefinition,
 }
 
 impl From<ComponentDefinition> for JsComponentDefinition {

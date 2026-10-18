@@ -20,6 +20,79 @@ pub struct JsComponentCompiler {
     internal: Compiler,
     structs_and_enums: Vec<Type>,
     diagnostics: Vec<slint_interpreter::Diagnostic>,
+    /// The options set through the setters, for the compiler that a live preview builds with.
+    #[cfg(feature = "live-preview")]
+    options: CompilerOptions,
+    #[cfg(feature = "live-preview")]
+    live_compiler: Option<i_slint_live_preview::live_compiler::LiveCompiler>,
+}
+
+/// The options of a `ComponentCompiler` that a compiler on another thread can be set up with.
+#[cfg(feature = "live-preview")]
+#[derive(Default)]
+struct CompilerOptions {
+    style: Option<String>,
+    include_paths: Option<Vec<PathBuf>>,
+    library_paths: Option<HashMap<String, PathBuf>>,
+}
+
+#[cfg(feature = "live-preview")]
+impl CompilerOptions {
+    fn new_compiler(&self) -> Compiler {
+        let mut compiler = compiler_from_env();
+        if let Some(style) = &self.style {
+            compiler.set_style(style.clone());
+        }
+        if let Some(include_paths) = &self.include_paths {
+            compiler.set_include_paths(include_paths.clone());
+        }
+        if let Some(library_paths) = &self.library_paths {
+            compiler.set_library_paths(library_paths.clone());
+        }
+        compiler
+    }
+}
+
+/// A compiler with the include and library paths of `SLINT_INCLUDE_PATH` and `SLINT_LIBRARY_PATH`.
+fn compiler_from_env() -> Compiler {
+    let mut compiler = Compiler::default();
+    let include_paths = match std::env::var_os("SLINT_INCLUDE_PATH") {
+        Some(paths) => {
+            std::env::split_paths(&paths).filter(|path| !path.as_os_str().is_empty()).collect()
+        }
+        None => Vec::new(),
+    };
+    let library_paths = match std::env::var_os("SLINT_LIBRARY_PATH") {
+        Some(paths) => std::env::split_paths(&paths)
+            .filter_map(|entry| {
+                entry
+                    .to_str()
+                    .unwrap_or_default()
+                    .split('=')
+                    .collect_tuple()
+                    .map(|(k, v)| (k.into(), v.into()))
+            })
+            .collect(),
+        None => HashMap::new(),
+    };
+
+    // Environment variables rank below the project file, so they bypass the setters.
+    let config = compiler.compiler_configuration(i_slint_core::InternalToken);
+    config.include_paths = include_paths;
+    config.library_paths = library_paths;
+    compiler
+}
+
+impl JsComponentCompiler {
+    fn take_result(
+        &mut self,
+        result: slint_interpreter::CompilationResult,
+    ) -> HashMap<String, JsComponentDefinition> {
+        self.structs_and_enums =
+            result.structs_and_enums(i_slint_core::InternalToken {}).cloned().collect::<Vec<_>>();
+        self.diagnostics = result.diagnostics().collect();
+        result.components().map(|c| (c.name().to_owned(), c.into())).collect()
+    }
 }
 
 #[napi]
@@ -27,38 +100,25 @@ impl JsComponentCompiler {
     /// Returns a new ComponentCompiler.
     #[napi(constructor)]
     pub fn new() -> Self {
-        let mut compiler = Compiler::default();
-        let include_paths = match std::env::var_os("SLINT_INCLUDE_PATH") {
-            Some(paths) => {
-                std::env::split_paths(&paths).filter(|path| !path.as_os_str().is_empty()).collect()
-            }
-            None => Vec::new(),
-        };
-        let library_paths = match std::env::var_os("SLINT_LIBRARY_PATH") {
-            Some(paths) => std::env::split_paths(&paths)
-                .filter_map(|entry| {
-                    entry
-                        .to_str()
-                        .unwrap_or_default()
-                        .split('=')
-                        .collect_tuple()
-                        .map(|(k, v)| (k.into(), v.into()))
-                })
-                .collect(),
-            None => HashMap::new(),
-        };
-
-        // Environment variables rank below the project file, so they bypass the setters.
-        let config = compiler.compiler_configuration(i_slint_core::InternalToken);
-        config.include_paths = include_paths;
-        config.library_paths = library_paths;
-
-        Self { internal: compiler, diagnostics: Vec::new(), structs_and_enums: vec![] }
+        Self {
+            internal: compiler_from_env(),
+            diagnostics: Vec::new(),
+            structs_and_enums: vec![],
+            #[cfg(feature = "live-preview")]
+            options: CompilerOptions::default(),
+            #[cfg(feature = "live-preview")]
+            live_compiler: None,
+        }
     }
 
     #[napi(setter)]
     pub fn set_include_paths(&mut self, include_paths: Vec<String>) {
-        self.internal.set_include_paths(include_paths.iter().map(PathBuf::from).collect());
+        let include_paths: Vec<PathBuf> = include_paths.iter().map(PathBuf::from).collect();
+        #[cfg(feature = "live-preview")]
+        {
+            self.options.include_paths = Some(include_paths.clone());
+        }
+        self.internal.set_include_paths(include_paths);
     }
 
     #[napi(getter)]
@@ -77,6 +137,10 @@ impl JsComponentCompiler {
             library_paths.insert(key, PathBuf::from(path));
         }
 
+        #[cfg(feature = "live-preview")]
+        {
+            self.options.library_paths = Some(library_paths.clone());
+        }
         self.internal.set_library_paths(library_paths);
     }
 
@@ -93,6 +157,10 @@ impl JsComponentCompiler {
 
     #[napi(setter)]
     pub fn set_style(&mut self, style: String) {
+        #[cfg(feature = "live-preview")]
+        {
+            self.options.style = Some(style.clone());
+        }
         self.internal.set_style(style);
     }
 
@@ -225,11 +293,65 @@ impl JsComponentCompiler {
     /// Returns the compiled `ComponentDefinition` if there were no errors.
     #[napi]
     pub fn build_from_path(&mut self, path: String) -> HashMap<String, JsComponentDefinition> {
-        let r = spin_on::spin_on(self.internal.build_from_path(PathBuf::from(path)));
-        self.structs_and_enums =
-            r.structs_and_enums(i_slint_core::InternalToken {}).cloned().collect::<Vec<_>>();
-        self.diagnostics = r.diagnostics().collect();
-        r.components().map(|c| (c.name().to_owned(), c.into())).collect()
+        let result = spin_on::spin_on(self.internal.build_from_path(PathBuf::from(path)));
+        self.take_result(result)
+    }
+
+    /// @hidden
+    /// Like `buildFromPath`, and builds the file again when one of the files it reads changes.
+    /// `onRebuild` receives the diagnostics and the components of each new build.
+    #[napi(
+        ts_args_type = "path: string, onRebuild: (diagnostics: Diagnostic[], definitions: Record<string, ComponentDefinition>) => void"
+    )]
+    pub fn build_from_path_live(
+        &mut self,
+        path: String,
+        on_rebuild: Function<'_, (), ()>,
+    ) -> napi::Result<HashMap<String, JsComponentDefinition>> {
+        #[cfg(feature = "live-preview")]
+        {
+            use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunctionCallMode};
+            let config = self.internal.compiler_configuration(i_slint_core::InternalToken);
+            if config.open_import_callback.is_some() {
+                return Err(napi::Error::from_reason(
+                    "The live preview doesn't support a fileLoader",
+                ));
+            }
+            // Weak, so that watching doesn't keep Node.js running.
+            let on_rebuild = on_rebuild
+                .build_threadsafe_function::<slint_interpreter::SendableCompilationResult>()
+                .callee_handled::<false>()
+                .weak::<true>()
+                .build_callback(
+                    |ctx: ThreadsafeCallContext<slint_interpreter::SendableCompilationResult>| {
+                        let result: slint_interpreter::CompilationResult = ctx.value.into();
+                        let diagnostics: Vec<JsDiagnostic> =
+                            result.diagnostics().map(JsDiagnostic::from).collect();
+                        let definitions: HashMap<String, JsComponentDefinition> =
+                            result.components().map(|c| (c.name().to_owned(), c.into())).collect();
+                        Ok(FnArgs::from((diagnostics, definitions)))
+                    },
+                )?;
+            let options = std::mem::take(&mut self.options);
+            let (live_compiler, first_build) =
+                i_slint_live_preview::live_compiler::LiveCompiler::start(
+                    move || options.new_compiler(),
+                    PathBuf::from(path),
+                    move |result| {
+                        on_rebuild.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+                    },
+                )
+                .map_err(napi::Error::from_reason)?;
+            self.live_compiler = Some(live_compiler);
+            Ok(self.take_result(first_build.into()))
+        }
+        #[cfg(not(feature = "live-preview"))]
+        {
+            let _ = (path, on_rebuild);
+            Err(napi::Error::from_reason(
+                "Install slint-ui-dev, at the same version as slint-ui, to use the live preview",
+            ))
+        }
     }
 
     /// Compile some .slint code into a ComponentDefinition
@@ -239,10 +361,8 @@ impl JsComponentCompiler {
         source_code: String,
         path: String,
     ) -> HashMap<String, JsComponentDefinition> {
-        let r = spin_on::spin_on(self.internal.build_from_source(source_code, PathBuf::from(path)));
-        self.diagnostics = r.diagnostics().collect();
-        self.structs_and_enums =
-            r.structs_and_enums(i_slint_core::InternalToken {}).cloned().collect::<Vec<_>>();
-        r.components().map(|c| (c.name().to_owned(), c.into())).collect()
+        let result =
+            spin_on::spin_on(self.internal.build_from_source(source_code, PathBuf::from(path)));
+        self.take_result(result)
     }
 }
